@@ -20,6 +20,10 @@ const openai = new OpenAI({
   apiKey: openaiApiKey
 });
 
+// In-memory conversation store
+// Structure: { phoneNumber: { state: 'awaiting_receipt_details', imageId: 'xxx', messages: [...] } }
+const conversations = new Map();
+
 // System prompt for policy questions
 const POLICY_SYSTEM_PROMPT = "# You are a helpful policy assistant that answers user questions around policies" +
     "\n" +
@@ -239,31 +243,78 @@ app.post('/', async (req, res) => {
 
     console.log(`Received message from: ${senderPhone}`);
 
+    // Get or create conversation state
+    if (!conversations.has(senderPhone)) {
+      conversations.set(senderPhone, { state: 'idle', messages: [] });
+    }
+    const conversation = conversations.get(senderPhone);
+
     // Check if it's a text message
     if (message.type === 'text') {
       const userQuestion = message.text.body;
       console.log(`User question: ${userQuestion}`);
+      conversation.messages.push({ type: 'text', content: userQuestion, timestamp: new Date() });
+
+      // Check if we're waiting for receipt details
+      if (conversation.state === 'awaiting_receipt_details') {
+        try {
+          // Process the receipt with user-provided details
+          await sendWhatsAppMessage(senderPhone, 'text', {
+            body: `✅ Receipt processed!\n\nImage ID: ${conversation.imageId}\nDetails: ${userQuestion}\n\nYour expense has been recorded. Our team will review it according to the policy guidelines.`
+          });
+
+          // Reset conversation state
+          conversation.state = 'idle';
+          conversation.imageId = null;
+        } catch (error) {
+          console.error('Failed to process receipt details:', error);
+          await sendWhatsAppMessage(senderPhone, 'text', {
+            body: 'Sorry, I encountered an error while processing your receipt details. Please try again later.'
+          });
+        }
+      } else {
+        // Normal policy question flow
+        try {
+          // Get LLM response for the policy question
+          const llmResponse = await getPolicyResponse(userQuestion);
+
+          // Send the LLM response back to the user
+          await sendWhatsAppMessage(senderPhone, 'text', {
+            body: llmResponse
+          });
+        } catch (error) {
+          console.error('Failed to process question or send reply:', error);
+
+          // Send fallback message
+          await sendWhatsAppMessage(senderPhone, 'text', {
+            body: 'Sorry, I encountered an error while processing your question. Please try again later.'
+          });
+        }
+      }
+    } else if (message.type === 'image') {
+      console.log(`Received image from ${senderPhone} - treating as receipt`);
+      const imageId = message.image.id;
+
+      conversation.messages.push({ type: 'image', imageId: imageId, timestamp: new Date() });
+      conversation.state = 'awaiting_receipt_details';
+      conversation.imageId = imageId;
 
       try {
-        // Get LLM response for the policy question
-        const llmResponse = await getPolicyResponse(userQuestion);
-
-        // Send the LLM response back to the user
+        // Acknowledge receipt and ask for details
         await sendWhatsAppMessage(senderPhone, 'text', {
-          body: llmResponse
+          body: 'Thank you for uploading your receipt! To process this expense, please provide the following details:\n\n1. What was this expense for?\n2. 3. Expense category (e.g., meals, transport, accommodation)'
         });
       } catch (error) {
-        console.error('Failed to process question or send reply:', error);
+        console.error('Failed to send receipt acknowledgment:', error);
 
-        // Send fallback message
         await sendWhatsAppMessage(senderPhone, 'text', {
-          body: 'Sorry, I encountered an error while processing your question. Please try again later.'
+          body: 'Sorry, I encountered an error while processing your receipt. Please try again later.'
         });
       }
     } else {
       // Handle non-text messages
       await sendWhatsAppMessage(senderPhone, 'text', {
-        body: 'I can only respond to text messages. Please send your policy question as text.'
+        body: 'I can only respond to text messages and images. Please send your policy question as text or upload a receipt as an image.'
       });
     }
   }
