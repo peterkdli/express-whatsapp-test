@@ -24,6 +24,19 @@ const openai = new OpenAI({
 // Structure: { phoneNumber: { state: 'awaiting_receipt_details', imageId: 'xxx', messages: [...] } }
 const conversations = new Map();
 
+// System prompt for expense extraction agent
+const EXPENSE_EXTRACTION_PROMPT = `You are an expense extraction assistant. Your job is to collect two pieces of information from the user:
+1. **Reason for expense**: What was the expense for? (e.g., "business lunch with client", "taxi to airport", "hotel for conference")
+2. **Cost centre**: Which department/cost centre should this be charged to? (e.g., "Marketing", "Sales", "Engineering", "R&D")
+
+Rules:
+- Be conversational and friendly
+- Ask follow-up questions if information is missing or unclear
+- If the user provides both pieces of information, respond with ONLY a JSON object in this exact format: {"status": "complete", "reason": "...", "costCentre": "..."}
+- If information is missing, ask for it naturally and respond with: {"status": "incomplete", "message": "your question here"}
+- Never make assumptions about missing information
+- Keep responses concise and natural`;
+
 // System prompt for policy questions
 const POLICY_SYSTEM_PROMPT = "# You are a helpful policy assistant that answers user questions around policies" +
     "\n" +
@@ -152,6 +165,44 @@ app.get('/', (req, res) => {
   }
 });
 
+// Function to get LLM response for expense extraction
+async function getExpenseExtractionResponse(conversationHistory) {
+  try {
+    console.log('Getting expense extraction response');
+
+    // Build messages array with conversation history
+    const messages = [
+      {
+        role: "system",
+        content: EXPENSE_EXTRACTION_PROMPT
+      },
+      ...conversationHistory
+    ];
+
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: messages,
+      temperature: 0.3,
+      max_tokens: 300
+    });
+
+    const llmResponse = response.choices[0].message.content;
+    console.log(`Expense extraction response: ${llmResponse}`);
+
+    // Try to parse as JSON
+    try {
+      const parsed = JSON.parse(llmResponse);
+      return parsed;
+    } catch (e) {
+      // If not valid JSON, treat as incomplete with the message
+      return { status: 'incomplete', message: llmResponse };
+    }
+  } catch (error) {
+    console.error('Error getting expense extraction response:', error);
+    return { status: 'error', message: 'Sorry, I encountered an error. Please try again.' };
+  }
+}
+
 // Function to get LLM response for policy questions
 async function getPolicyResponse(userQuestion) {
   try {
@@ -245,7 +296,7 @@ app.post('/', async (req, res) => {
 
     // Get or create conversation state
     if (!conversations.has(senderPhone)) {
-      conversations.set(senderPhone, { state: 'idle', messages: [] });
+      conversations.set(senderPhone, { state: 'idle', messages: [], llmHistory: [] });
     }
     const conversation = conversations.get(senderPhone);
 
@@ -258,14 +309,42 @@ app.post('/', async (req, res) => {
       // Check if we're waiting for receipt details
       if (conversation.state === 'awaiting_receipt_details') {
         try {
-          // Process the receipt with user-provided details
-          await sendWhatsAppMessage(senderPhone, 'text', {
-            body: `✅ Receipt processed!\n\nImage ID: ${conversation.imageId}\nDetails: ${userQuestion}\n\nYour expense has been recorded. Our team will review it according to the policy guidelines.`
+          // Add user message to LLM history
+          conversation.llmHistory.push({
+            role: 'user',
+            content: userQuestion
           });
 
-          // Reset conversation state
-          conversation.state = 'idle';
-          conversation.imageId = null;
+          // Get LLM response to extract expense details
+          const extractionResult = await getExpenseExtractionResponse(conversation.llmHistory);
+
+          if (extractionResult.status === 'complete') {
+            // All details collected, process the expense
+            await sendWhatsAppMessage(senderPhone, 'text', {
+              body: `✅ Receipt processed!\n\nImage ID: ${conversation.imageId}\nReason: ${extractionResult.reason}\nCost Centre: ${extractionResult.costCentre}\n\nYour expense has been recorded. Our team will review it according to the policy guidelines.`
+            });
+
+            // Reset conversation state
+            conversation.state = 'idle';
+            conversation.imageId = null;
+            conversation.llmHistory = [];
+          } else if (extractionResult.status === 'error') {
+            // Error occurred
+            await sendWhatsAppMessage(senderPhone, 'text', {
+              body: extractionResult.message
+            });
+          } else {
+            // Still incomplete, ask follow-up question
+            await sendWhatsAppMessage(senderPhone, 'text', {
+              body: extractionResult.message
+            });
+
+            // Add assistant response to history
+            conversation.llmHistory.push({
+              role: 'assistant',
+              content: extractionResult.message
+            });
+          }
         } catch (error) {
           console.error('Failed to process receipt details:', error);
           await sendWhatsAppMessage(senderPhone, 'text', {
@@ -302,7 +381,7 @@ app.post('/', async (req, res) => {
       try {
         // Acknowledge receipt and ask for details
         await sendWhatsAppMessage(senderPhone, 'text', {
-          body: 'Thank you for uploading your receipt! To process this expense, please provide the following details:\n\n1. What was this expense for?\n2. 3. Expense category (e.g., meals, transport, accommodation)'
+          body: 'Thank you for uploading your receipt! To process this expense, please provide the following details:\n\n1. What was this expense for?\n2. Expense category (e.g., meals, transport, accommodation)'
         });
       } catch (error) {
         console.error('Failed to send receipt acknowledgment:', error);
